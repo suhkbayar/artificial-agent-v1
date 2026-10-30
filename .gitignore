@@ -1,0 +1,13 @@
+.claude/settings.local.json
+
+# orchestrator runtime (README §1)
+state.db
+state.db-*
+logs/
+checkpoints/
+.env*
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

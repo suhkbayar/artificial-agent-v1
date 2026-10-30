@@ -1,0 +1,300 @@
+# qinno RBAC v2 — S1..S6 (6 sessions, Claude + Codex tracks).
+# Source: ~/Documents/Projects/qinno/docs/planning/rbac-v2/ (README + s1..s6-{claude,codex}-*.md),
+# read-only. Schema: docs/planning/orchestrator-v1/README.md §2.
+#
+# Conventions in this file:
+#  - `tests` are the "Verification" commands of BOTH the Claude and the Codex task file, minus
+#    `prettier --write` (a formatter, not a check) and the develop2 seed commands (post_steps).
+#    The task files pipe every command through `2>&1 | tail -N`, which hides the exit code; the
+#    pipes are dropped here because the gate needs the real exit code (the runner captures output).
+#    Shell loops end with `|| exit 1` for the same reason (the task files only `echo`).
+#  - Codex allowlists are the "File allowlist" blocks of the codex task files, minus the
+#    "(new)" annotations.
+#  - `TODO ...` marks a value the task files do not state; none are guessed.
+#  - `schema_allowlist` (per session) = the `packages/db/**` files in that session's Claude
+#    "Ownership" block. Without it the policy hard-stops (BLOCKED) on ANY schema edit. Only S1 owns
+#    schema files (s1-claude-foundation.md "Ownership"); S2-S6 own none, so an edit there still
+#    hard-stops. Policy can only be tightened here (`policy:` keys = deny-list additions).
+
+name: qinno-rbac-v2
+repo: ~/Documents/Projects/qinno
+plan_dir: docs/planning/rbac-v2
+
+# Plan README line 186 and s6-claude-qa-release.md line 201 say "signing/updater: do not touch" but
+# no file names it. The built-in policy has a broad net (**/updater/**, **/*signing*/**,
+# *.keystore, *.p12, *.pem); precise paths go in `policy.forbidden_write_globs` once they are known.
+open_items:
+  - "TODO exact signing/updater paths for policy.forbidden_write_globs (plan files say only 'signing/updater')"
+
+# O12 (readme.md §2): $2 per call, $10 per session, $100 total.
+budget_usd: { per_call: 2, per_session: 10, total: 100 }
+
+sessions:
+  - id: S1
+    claude_task: s1-claude-foundation.md
+    codex_task: s1-codex-role-keys.md
+    handoff: handoff-s1.md
+    depends_on: []
+    codex_allowlist:
+      - packages/common/src/enums/permission/role-key.ts
+      - packages/common/src/enums/permission/index.ts
+      - services/merchant-service/src/services/user-service.ts
+      - services/merchant-service/src/services/device-service.ts
+      - services/merchant-service/src/services/authentication-service.ts
+      - services/merchant-service/src/services/registration-service.ts
+      - packages/core/src/services/guest-service.ts
+      - packages/core/src/repositories/manager-user-repository.ts
+      - packages/common/src/types/user/manager-users.ts
+      - apps/manager/src/utils/permissions.ts
+      - apps/manager/src/hooks/use-access.ts
+      - apps/manager/src/stores/auth.ts
+      - apps/manager/src/graphql/queries/manager-user.ts
+    tests:
+      - yarn workspace @qinno/common type-check
+      - yarn workspace @qinno/core test
+      - yarn workspace @qinno/core type-check
+      - yarn workspace @qinno/merchant-service test
+      - npx tsc --noEmit -p services/merchant-service
+      - yarn workspace @qinno/manager-service test
+      - yarn workspace @qinno/finance-service test
+      - yarn workspace @qinno/finix-service test
+      - yarn workspace @qinno/customer-service test
+      - yarn workspace @qinno/manager test
+      - npx tsc --noEmit -p apps/manager
+    # s1-claude-foundation.md T1 (migrate = sync-secrets + drizzle-kit push; must print
+    # "Syncing secrets for stage: develop2") and T2 (roles.key seeds; the full `seed` never).
+    post_steps:
+      - drizzle_push_develop2
+      - seed_manager_develop2
+      - seed_finance_develop2
+      - seed_customer_develop2
+      - seed_merchant_develop2
+    memory_entities: ["Decision: RBAC v2"]
+    # s1-claude-foundation.md "Ownership": roles.key, users (pin), merchant-users (allBranches)
+    schema_allowlist:
+      - packages/db/src/schemas/core/roles.ts
+      - packages/db/src/schemas/core/users.ts
+      - packages/db/src/schemas/core/merchant-users.ts
+
+  - id: S2
+    claude_task: s2-claude-permissions-seed.md
+    codex_task: s2-codex-merchant-gating.md
+    handoff: handoff-s2.md
+    depends_on: [S1]
+    codex_allowlist:
+      - services/merchant-service/src/services/route-service.ts
+      - services/merchant-service/src/services/index.ts
+      - services/merchant-service/src/resolvers/private.ts
+      - apps/merchant/src/graphql/query/route.ts
+      - apps/merchant/src/graphql/query/index.ts
+      - apps/merchant/src/hooks/permission/useMyPermissions.ts
+      - apps/merchant/src/hooks/permission/useMyRoutes.ts
+      - apps/merchant/src/utils/permissions.ts
+      - apps/merchant/src/utils/permissions.test.ts
+      - apps/merchant/src/components/atoms/PermissionGate.tsx
+      - apps/merchant/src/components/atoms/index.ts
+      - apps/merchant/src/components/organisms/AppSidebar.tsx
+      - apps/merchant/src/utils/auth.ts
+      - apps/merchant/src/locales/*/translation.json
+    tests:
+      - yarn workspace @qinno/core test
+      - yarn workspace @qinno/core type-check
+      - yarn workspace @qinno/merchant-service test
+      - npx tsc --noEmit -p services/merchant-service
+      - npx tsc --noEmit -p services/migrate-service
+      - yarn workspace @qinno/merchant test
+      - yarn workspace @qinno/merchant check-types
+      - yarn workspace @qinno/customer-service test
+      - |-
+        for f in apps/merchant/src/locales/*/translation.json; do
+          jq -e '.permission.noAccessTitle' "$f" >/dev/null || { echo "MISSING $f"; exit 1; }
+        done
+    # s2-claude-permissions-seed.md: seed:merchant on develop2, run twice (2nd run must be 0/0).
+    post_steps:
+      - seed_merchant_develop2
+      - seed_merchant_develop2
+    memory_entities: ["Decision: RBAC v2"]
+
+  - id: S3
+    claude_task: s3-claude-pin-sessions.md
+    codex_task: s3-codex-pin-sessions-ui.md
+    handoff: handoff-s3.md
+    depends_on: [S2]
+    codex_allowlist:
+      - apps/merchant/src/pages/private/staff/edit.tsx
+      - apps/merchant/src/hooks/staff/useStaffEditForm.ts
+      - apps/merchant/src/pages/private/kitchen/settings.tsx
+      - apps/merchant/src/hooks/kitchen/useKitchenDeviceListPage.ts
+      - apps/merchant/src/graphql/mutation/kitchen.ts
+      - apps/merchant/src/graphql/query/kitchen-device.ts
+      - apps/merchant/src/types/kitchen/kitchenDevice.types.ts
+      - apps/merchant/src/graphql/query/session.ts
+      - apps/merchant/src/graphql/mutation/session.ts
+      - apps/merchant/src/graphql/query/index.ts
+      - apps/merchant/src/graphql/mutation/index.ts
+      - apps/merchant/src/hooks/session/useMySessions.ts
+      - apps/merchant/src/utils/session.ts
+      - apps/merchant/src/utils/session.test.ts
+      - apps/merchant/src/utils/device-id.ts
+      - apps/merchant/src/pages/private/setting/sessions.tsx
+      - apps/merchant/src/pages/private/setting/index.tsx
+      - apps/merchant/src/constants/routePaths.ts
+      - apps/merchant/src/pages/private/router.tsx
+      - apps/merchant/src/graphql/mutation/login.ts
+      - apps/merchant/src/pages/public/login/index.tsx
+      - apps/merchant/src/types/auth/auth.types.ts
+      - apps/merchant/src/locales/*/translation.json
+    tests:
+      - yarn workspace @qinno/common type-check
+      - yarn workspace @qinno/core test
+      - yarn workspace @qinno/core type-check
+      - yarn workspace @qinno/merchant-service test
+      - npx tsc --noEmit -p services/merchant-service
+      - yarn workspace @qinno/merchant test
+      - yarn workspace @qinno/merchant check-types
+      - yarn workspace @qinno/customer-service test
+      - |-
+        for f in apps/merchant/src/locales/*/translation.json; do
+          jq -e '.sessions.title and .staff.pinDuplicate and .kitchen.deviceTypePos' "$f" >/dev/null \
+            || { echo "MISSING $f"; exit 1; }
+        done
+    post_steps: []
+    memory_entities: ["Decision: RBAC v2"]
+
+  - id: S4
+    claude_task: s4-claude-manager-approval.md
+    codex_task: s4-codex-pos-lock-approval.md
+    handoff: handoff-s4.md
+    depends_on: [S3]
+    codex_allowlist:
+      - apps/merchant/src/config/apollo-client.ts
+      - apps/merchant/src/utils/auth-override-link.ts
+      - apps/merchant/src/utils/auth-override-link.test.ts
+      - apps/merchant/src/utils/pos-device.ts
+      - apps/merchant/src/utils/pos-device.test.ts
+      - apps/merchant/src/utils/approval.ts
+      - apps/merchant/src/utils/approval.test.ts
+      - apps/merchant/src/graphql/mutation/approval.ts
+      - apps/merchant/src/graphql/mutation/device-auth.ts
+      - apps/merchant/src/graphql/mutation/index.ts
+      - apps/merchant/src/hooks/pos/usePosLock.ts
+      - apps/merchant/src/hooks/pos/useManagerApproval.ts
+      - apps/merchant/src/components/organisms/pos/PosLockOverlay.tsx
+      - apps/merchant/src/components/organisms/pos/index.ts
+      - apps/merchant/src/components/molecules/pos/ApprovalPinModal.tsx
+      - apps/merchant/src/components/molecules/pos/PosDeviceActivationModal.tsx
+      - apps/merchant/src/components/molecules/pos/index.ts
+      - apps/merchant/src/components/molecules/pos/DiscountModal.tsx
+      - apps/merchant/src/components/molecules/OrderDiscountSummary.tsx
+      - apps/merchant/src/components/molecules/pos/ReturnOrderItemModal.tsx
+      - apps/merchant/src/components/molecules/pos/CancelOrderModal.tsx
+      - apps/merchant/src/components/molecules/pos/TerminalRefundModal.tsx
+      - apps/merchant/src/components/organisms/pos/PosOrderDetailModal.tsx
+      - apps/merchant/src/components/organisms/financeOrders/CardRefundAction.tsx
+      - apps/merchant/src/hooks/useOrder.ts
+      - apps/merchant/src/pages/private/pos/index.tsx
+      - "apps/merchant/src/pages/private/pos/[orderId].tsx"
+      - apps/merchant/src/locales/*/translation.json
+    tests:
+      - yarn workspace @qinno/common type-check
+      - yarn workspace @qinno/core test
+      - yarn workspace @qinno/core type-check
+      - yarn workspace @qinno/merchant-service test
+      - npx tsc --noEmit -p services/merchant-service
+      - yarn workspace @qinno/merchant test
+      - yarn workspace @qinno/merchant check-types
+      - yarn workspace @qinno/customer-service test
+      - |-
+        for f in apps/merchant/src/locales/*/translation.json; do
+          jq -e '.posLock.title and .approval.title' "$f" >/dev/null || { echo "MISSING $f"; exit 1; }
+        done
+    # s4-claude-manager-approval.md: requestManagerApproval op maps via the S2 sync step;
+    # develop2 seed:merchant x2 (2nd run 0/0).
+    post_steps:
+      - seed_merchant_develop2
+      - seed_merchant_develop2
+    memory_entities: ["Decision: RBAC v2"]
+
+  - id: S5
+    claude_task: s5-claude-custom-roles.md
+    codex_task: s5-codex-roles-staff-ui.md
+    handoff: handoff-s5.md
+    depends_on: [S4]
+    codex_allowlist:
+      - services/merchant-service/src/resolvers/private.ts
+      - apps/merchant/src/graphql/query/role.ts
+      - apps/merchant/src/graphql/mutation/role.ts
+      - apps/merchant/src/graphql/query/my-merchant.ts
+      - apps/merchant/src/graphql/mutation/my-merchant.ts
+      - apps/merchant/src/graphql/query/index.ts
+      - apps/merchant/src/graphql/mutation/index.ts
+      - apps/merchant/src/graphql/query/staff.ts
+      - apps/merchant/src/graphql/mutation/staff.ts
+      - apps/merchant/src/types/role/**
+      - apps/merchant/src/types/staff/**
+      - apps/merchant/src/hooks/role/**
+      - apps/merchant/src/hooks/staff/useStaffNewForm.ts
+      - apps/merchant/src/hooks/staff/useStaffEditForm.ts
+      - apps/merchant/src/utils/role-matrix.ts
+      - apps/merchant/src/utils/role-matrix.test.ts
+      - apps/merchant/src/pages/private/roles/**
+      - apps/merchant/src/pages/private/staff/new.tsx
+      - apps/merchant/src/pages/private/staff/edit.tsx
+      - apps/merchant/src/pages/private/router.tsx
+      - apps/merchant/src/constants/routePaths.ts
+      - apps/merchant/src/components/organisms/MerchantSwitcher.tsx
+      - apps/merchant/src/components/organisms/index.ts
+      - apps/merchant/src/components/templates/DashboardLayout.tsx
+      - apps/merchant/src/locales/*/translation.json
+    # The codex file's `grep -n "ROUTE_PATHS.ROLES" ...  # no PLACEHOLDER_ROUTES entry left` is a
+    # manual check whose pass condition is not an exit code; it is omitted rather than guessed.
+    tests:
+      - yarn workspace @qinno/common type-check
+      - yarn workspace @qinno/core test
+      - yarn workspace @qinno/core type-check
+      - yarn workspace @qinno/merchant-service test
+      - npx tsc --noEmit -p services/merchant-service
+      - yarn workspace @qinno/merchant test
+      - yarn workspace @qinno/merchant check-types
+      - yarn workspace @qinno/finance-service test
+      - yarn workspace @qinno/customer-service test
+      - |-
+        for f in apps/merchant/src/locales/*/translation.json; do
+          jq -e '.roles.title and .staff.allBranches and .merchantSwitcher' "$f" >/dev/null \
+            || { echo "MISSING $f"; exit 1; }
+        done
+    post_steps: []
+    memory_entities: ["Decision: RBAC v2"]
+
+  - id: S6
+    claude_task: s6-claude-qa-release.md
+    codex_task: s6-codex-review-tests.md
+    handoff: "TODO handoff-s6.md (rbac-v2 README lists no handoff for S6; confirm what the gate reads)"
+    depends_on: [S5]
+    # Part A (review) is read-only; Part B may create only these four new test files.
+    codex_allowlist:
+      - services/merchant-service/src/__tests__/authz-matrix.fixture.ts
+      - services/merchant-service/src/__tests__/authz-matrix.integration.test.ts
+      - services/customer-service/src/services/__tests__/authz-qr-menu.test.ts
+      - services/finix-service/src/services/__tests__/authz-matrix.test.ts
+    tests:
+      - yarn workspace @qinno/common type-check
+      - yarn workspace @qinno/core test
+      - yarn workspace @qinno/core type-check
+      - |-
+        for s in merchant-service manager-service finance-service finix-service customer-service; do
+          yarn workspace @qinno/$s test || exit 1
+          npx tsc --noEmit -p services/$s || exit 1
+        done
+      - yarn workspace @qinno/merchant test
+      - yarn workspace @qinno/merchant check-types
+      - yarn workspace @qinno/manager test
+      - npx tsc --noEmit -p apps/manager
+      - npx tsc --noEmit -p apps/qr-menu
+      - |-
+        for f in apps/merchant/src/locales/*/translation.json; do
+          jq empty "$f" || { echo "BAD $f"; exit 1; }
+        done
+    # Production migrate/seed/deploy are user-only (O8); the Claude track only writes a runbook.
+    post_steps: []
+    memory_entities: ["Decision: RBAC v2"]
