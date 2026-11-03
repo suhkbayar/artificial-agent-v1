@@ -74,6 +74,9 @@ def render_plan(pipeline: Pipeline) -> str:
         lines.extend(f"     {g}" for g in s.schema_allowlist)
         lines.append(f"   codex_allowlist ({len(s.codex_allowlist)}):")
         lines.extend(f"     {g}" for g in s.codex_allowlist)
+        if s.known_red:
+            lines.append(f"   known_red ({len(s.known_red)}, not gated):")
+            lines.extend(f"     {c}" for c, _ in s.known_red)
         lines.append(f"   tests ({len(s.tests)}):")
         for t in s.tests:
             first, *rest = t.splitlines()
@@ -164,6 +167,23 @@ def status(pipeline_name: str | None) -> None:
         click.echo(render_status(db, config, pipeline_name))
 
 
+@main.command()
+@click.option("--port", default=8765, show_default=True, help="Loopback port.")
+def watch(port: int) -> None:
+    """Live view of state.db at http://127.0.0.1:<port>; its only write is the post-step OK."""
+    from orchestrator.watch import make_server
+
+    config = load_config()
+    server = make_server(config.state_db, port)
+    click.echo(f"watching {config.state_db} at http://127.0.0.1:{port} (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 @main.command("post-steps")
 def post_steps() -> None:
     """List the orchestrator-run post steps a pipeline may name."""
@@ -221,12 +241,19 @@ def _finish(outcome: RunOutcome) -> None:
 @main.command()
 @click.argument("pipeline_path", type=click.Path(dir_okay=False))
 @click.option("--only", "only", default=None, help="Run just this session id, e.g. S1.")
-def run(pipeline_path: str, only: str | None) -> None:
+@click.option(
+    "--model",
+    default=None,
+    help="Claude model for every agent phase, e.g. claude-sonnet-5-5 (default: the CLI's own). "
+    "Codex is not affected.",
+)
+def run(pipeline_path: str, only: str | None, model: str | None) -> None:
     """Preflight, then run the pipeline (every session, or just --only S1)."""
     pipeline = _load(pipeline_path)
     config = load_config()
+    options = FlowOptions(only=only, model=model)
     with caffeinate():
-        outcome = asyncio.run(run_pipeline(pipeline, config, build_deps(), FlowOptions(only=only)))
+        outcome = asyncio.run(run_pipeline(pipeline, config, build_deps(), options))
     _finish(outcome)
 
 
@@ -239,7 +266,13 @@ def run(pipeline_path: str, only: str | None) -> None:
     is_flag=True,
     help="Also retry steps that ended blocked/failed (after you fixed the cause).",
 )
-def resume(pipeline_name: str | None, retry: bool) -> None:
+@click.option(
+    "--model",
+    default=None,
+    help="Claude model for every agent phase, e.g. claude-sonnet-5-5 (default: the CLI's own). "
+    "Codex is not affected.",
+)
+def resume(pipeline_name: str | None, retry: bool, model: str | None) -> None:
     """Continue the latest unfinished run from its last unfinished step."""
     config = load_config()
     if not Path(config.state_db).exists():
@@ -263,7 +296,7 @@ def resume(pipeline_name: str | None, retry: bool) -> None:
                     pipeline,
                     config,
                     build_deps(),
-                    FlowOptions(only=only, retry=retry),
+                    FlowOptions(only=only, retry=retry, model=model),
                     run_id=run_row.id,
                     db=db,
                 )  # fmt: skip

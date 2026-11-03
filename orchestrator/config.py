@@ -37,6 +37,8 @@ class Config:
     quota_wait_s: int = 3600
     max_calls_per_hour: int = 60
     command_timeout_s: int = 60  # preflight subprocess checks
+    # O14: the user runs the develop2 post steps and presses OK in `watch`; false = O4 (unattended)
+    manual_post_steps: bool = True
 
 
 PROJECT_ROOT_ENV = "ORCHESTRATOR_PROJECT_ROOT"
@@ -77,4 +79,5 @@ def load_config(path: Path | None = None) -> Config:
         quota_wait_s=int(raw.get("quota_wait_s", 3600)),
         max_calls_per_hour=int(raw.get("max_calls_per_hour", 60)),
         command_timeout_s=int(raw.get("command_timeout_s", 60)),
+        manual_post_steps=bool(raw.get("manual_post_steps", True)),
     )

@@ -15,8 +15,9 @@ import yaml
 from orchestrator.config import DEFAULT_BUDGET_USD, Budget
 from orchestrator.policy import PolicyConfig, PolicyContext
 
-# Orchestrator-run steps that touch a shared database (O4). Agents never run these; the
-# orchestrator does, on develop2 only, after re-running the stage preflight checks.
+# Steps that touch a shared database. Agents never run these. By default the user runs them and
+# presses OK in `watch` (O14); with `manual_post_steps = false` the orchestrator does (O4). Either
+# way develop2 only, after re-running the stage preflight checks.
 # `run_post_step` itself lands in S3; S1 only defines the names so a pipeline can be validated.
 REQUIRED_STAGE = "develop2"
 
@@ -26,28 +27,37 @@ class PostStepDef:
     description: str
     command: str  # run from the pipeline repo root by the orchestrator, never by an agent
     stage: str = REQUIRED_STAGE
+    # Same step without sync-secrets/AWS, for when DB_* come from migrate-service/.env.local.
+    local_command: str = ""
 
+
+_LOCAL = "cd services/migrate-service && "
 
 POST_STEPS: dict[str, PostStepDef] = {
     "drizzle_push_develop2": PostStepDef(
         "drizzle-kit push to develop2 (migrate-service `migrate` runs sync-secrets first)",
         "yarn workspace @qinno/migrate-service migrate",
+        local_command=_LOCAL + "npx --no-install drizzle-kit push",
     ),
     "seed_manager_develop2": PostStepDef(
         "per-system manager seed on develop2 (never the full `seed`)",
         "yarn workspace @qinno/migrate-service seed:manager",
+        local_command=_LOCAL + "npx --no-install tsx src/seeds/manager.ts",
     ),
     "seed_finance_develop2": PostStepDef(
         "per-system finance seed on develop2",
         "yarn workspace @qinno/migrate-service seed:finance",
+        local_command=_LOCAL + "npx --no-install tsx src/seeds/finance.ts",
     ),
     "seed_customer_develop2": PostStepDef(
         "per-system customer seed on develop2",
         "yarn workspace @qinno/migrate-service seed:customer",
+        local_command=_LOCAL + "npx --no-install tsx src/seeds/customer.ts",
     ),
     "seed_merchant_develop2": PostStepDef(
         "per-system merchant seed on develop2; run twice, 2nd run must be 0 added / 0 removed",
         "yarn workspace @qinno/migrate-service seed:merchant",
+        local_command=_LOCAL + "npx --no-install tsx src/seeds/merchant.ts",
     ),
 }
 
@@ -72,6 +82,9 @@ class SessionSpec:
     schema_allowlist: tuple[str, ...] = ()
     # Extra deny entries for this session only (see PolicyConfig.tightened: can never loosen).
     policy: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Task-file verification commands that already fail WITHOUT this work (a human checked the
+    # base commit): (command, reason). Never gated; ⑤ verify is told not to block on them.
+    known_red: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -177,6 +190,27 @@ def _parse_policy(raw: object, where: str, errors: list[str]) -> dict[str, tuple
     return out
 
 
+def _parse_known_red(raw: object, where: str, errors: list[str]) -> tuple[tuple[str, str], ...]:
+    """`known_red:` list of {command, reason}; both non-empty strings, nothing else."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        errors.append(f"{where}: expected a list of {{command, reason}}")
+        return ()
+    out: list[tuple[str, str]] = []
+    for i, item in enumerate(raw):
+        ok = (
+            isinstance(item, dict)
+            and set(item) == {"command", "reason"}
+            and all(isinstance(item[k], str) and item[k].strip() for k in item)
+        )
+        if not ok:
+            errors.append(f"{where}[{i}]: expected {{command: <text>, reason: <text>}}")
+            continue
+        out.append((item["command"].strip(), item["reason"].strip()))
+    return tuple(out)
+
+
 def _parse_budget(raw: object, errors: list[str]) -> Budget:
     values = dict(DEFAULT_BUDGET_USD)
     if raw is not None:
@@ -246,6 +280,11 @@ def load_pipeline(path: Path | str, *, check_files: bool = True) -> Pipeline:
         allowlist = _as_str_tuple(item.get("codex_allowlist"), f"{where}.codex_allowlist", errors)
         if codex_task is None and allowlist:
             errors.append(f"{where}: codex_allowlist set but codex_task is null")
+        tests = _as_str_tuple(item.get("tests"), f"{where}.tests", errors)
+        known_red = _parse_known_red(item.get("known_red"), f"{where}.known_red", errors)
+        for command, _ in known_red:
+            if command in tests:
+                errors.append(f"{where}: `{command}` is in both tests and known_red")
         sessions.append(
             SessionSpec(
                 id=sid,
@@ -254,13 +293,14 @@ def load_pipeline(path: Path | str, *, check_files: bool = True) -> Pipeline:
                 handoff=str(item.get("handoff", "")),
                 depends_on=_as_str_tuple(item.get("depends_on"), f"{where}.depends_on", errors),
                 codex_allowlist=allowlist,
-                tests=_as_str_tuple(item.get("tests"), f"{where}.tests", errors),
+                tests=tests,
                 post_steps=post_steps,
                 memory_entities=_as_str_tuple(
                     item.get("memory_entities"), f"{where}.memory_entities", errors
                 ),
                 schema_allowlist=schema_allowlist,
                 policy=session_policy,
+                known_red=known_red,
             )
         )
 

@@ -111,7 +111,7 @@ def test_todos_are_reported(tmp_path):
 def test_shipped_qinno_pipeline_parses():
     p = load_pipeline(REAL, check_files=False)
     assert [s.id for s in p.order()] == ["S1", "S2", "S3", "S4", "S5", "S6"]
-    assert (p.budget.per_call, p.budget.per_session, p.budget.total) == (2.0, 10.0, 100.0)
+    assert (p.budget.per_call, p.budget.per_session, p.budget.total) == (4.0, 15.0, 100.0)
     # Every session names its Codex task and a non-empty allowlist and test list.
     for s in p.sessions:
         assert s.codex_task and s.codex_allowlist and s.tests, s.id

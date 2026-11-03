@@ -163,6 +163,7 @@ class Router:
         self.codex_calls: list[dict[str, Any]] = []
         self.codex_script: list[Any] = []  # callable(repo, prompt) -> CmdResult | CmdResult
         self.shell_calls: list[str] = []
+        self.shell_envs: list[dict[str, str] | None] = []
         self.shell: dict[str, Any] = {}  # substring of the command -> CmdResult | callable | list
 
     def __call__(self, cmd, *, timeout, cwd=None, env=None, input_text=None):
@@ -174,6 +175,7 @@ class Router:
             for key, reply in self.shell.items():
                 if key in cmd[2]:
                     self.shell_calls.append(cmd[2])
+                    self.shell_envs.append(env)
                     if isinstance(reply, list):
                         reply = reply.pop(0)
                     return reply() if callable(reply) else reply

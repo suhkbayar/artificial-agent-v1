@@ -69,6 +69,35 @@ def load_sdk_env(project_root: Path, *, name: str = ENV_FILE_NAME) -> dict[str, 
     return parse_env_text(text)
 
 
+# -- migrate-service `.env.local` (develop2 database target) ---------------------------------
+#
+# `drizzle-kit push` reads only `.env` (drizzle.config.ts: `dotenv.config()`); the seeds read
+# `.env.local` first. dotenv never overrides a variable that is already set, so the orchestrator
+# parses `services/migrate-service/.env.local` as DATA and hands all six DB_* variables to the
+# post-step subprocess: then neither tool can fall back to the production values in `.env`.
+DB_KEYS = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSL")
+MIGRATE_ENV_LOCAL = Path("services") / "migrate-service" / ENV_FILE_NAME
+
+
+def migrate_env_path(repo: Path) -> Path:
+    return Path(repo) / MIGRATE_ENV_LOCAL
+
+
+def load_migrate_env(repo: Path) -> dict[str, str] | None:
+    """DB_* from the qinno `services/migrate-service/.env.local`; None if the file is absent.
+
+    Only the six DB_* names are returned. Read errors raise EnvFileError (never with a value).
+    """
+    path = migrate_env_path(repo)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EnvFileError(f"cannot read {path}: {type(exc).__name__}") from None
+    return parse_env_text(text, DB_KEYS)
+
+
 def secret_values(env: Mapping[str, str] | None) -> tuple[str, ...]:
     """Values that must never appear in stored text, longest first so overlaps redact whole."""
     values = {v for v in (env or {}).values() if len(v) >= MIN_SECRET_LEN}
@@ -92,12 +121,18 @@ def redact(text: str | None, secrets: Iterable[str] = ()) -> str | None:
 # `auto`/`plan` are lost. Hence it is set only when there is a key to protect.
 SCRUB_SUBPROCESS_ENV = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
 SCRUB_OPT_OUT_ENV = "ORCHESTRATOR_SCRUB_SUBPROCESS_ENV"  # =0: keep auto/plan, key stays visible
+IGNORE_ENV_LOCAL_ENV = (
+    "ORCHESTRATOR_IGNORE_ENV_LOCAL"  # =1: do not read .env.local (claude.ai login)
+)
 
 
 def sdk_env(project_root: Path, *, environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The `env` for the Agent SDK: allowlisted `.env.local` values (+ the scrub flag if any)."""
+    source = environ if environ is not None else os.environ
+    if source.get(IGNORE_ENV_LOCAL_ENV) == "1":
+        return {}  # the file stays untouched; the SDK uses the machine's claude.ai login
     env = load_sdk_env(project_root)
-    opted_out = (environ if environ is not None else os.environ).get(SCRUB_OPT_OUT_ENV) == "0"
+    opted_out = source.get(SCRUB_OPT_OUT_ENV) == "0"
     if env and not opted_out:
         env[SCRUB_SUBPROCESS_ENV] = "1"
     return env

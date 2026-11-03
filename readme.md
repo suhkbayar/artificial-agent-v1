@@ -1,6 +1,6 @@
 # Agent Orchestrator — дизайн (шинэ төсөл)
 
-Төлөв (2026-10-30): дизайн (2026-10-29) + v1 MVP код S1-S3-аар бэлэн; pilot хүлээгдэж байна — `docs/planning/orchestrator-v1/handoff-s3.md`. Шинэ, тусдаа Python төсөл болгон шинэ сесст эхлүүлнэ.
+Төлөв (2026-10-30): дизайн (2026-10-29) + v1 MVP (S1-S3) DONE; pilot run 1 ажилласан (③-д тайлбартай BLOCKED, засагдсан) — `docs/planning/orchestrator-v1/pilot-s1.md`. Дараагийн сесс: `docs/planning/orchestrator-v1/next-session-prompt.md`. Шинэ, тусдаа Python төсөл болгон шинэ сесст эхлүүлнэ.
 Энэ файл = тэр сессийн эхлэх цэг. Анхны хэрэглээ: `docs/planning/rbac-v2/` (6 сесс, Claude + Codex).
 
 ---
@@ -37,6 +37,7 @@
 | O11 | Суваг: **зөвхөн web dashboard** (утаснаас хариулах Telegram байхгүй). Dashboard = MVP-ийн дараа тул MVP-д мэдэгдэл = `logs/` + `events` хүснэгт (dashboard тэндээс уншина). macOS notification сонгоогүй (2026-10-30) |
 | O12 | Мөнгөн хязгаар (USD): нэг дуудлага **2**, нэг сесс **10**, нийт **100** (2026-10-30)                                            |
 | O13 | `sst deploy` develop2-д **хэрэглэгч өөрөө** хийнэ; O5 (orchestrator deploy хийнэ) хүчингүй. O4 (`drizzle-kit push`, `seed:*`) хэвээр эсэхийг S3-ын эхэнд баталгаажуулна (2026-10-30) |
+| O14 | develop2 `post_steps` (`drizzle-kit push`, `seed:*`)-ийг **хэрэглэгч өөрөө** ажиллуулна; O4 хүчингүй. Orchestrator командуудыг terminal ба `watch` дээр харуулаад хүлээнэ, `watch`-ийн **OK** дарсны дараа үргэлжилнэ. Хуучин O4 = `~/.agent-orchestrator/config.toml`-д `manual_post_steps = false` (2026-11-02) |
 
 ## 3. Нээлттэй асуултууд (шинэ сессийн эхэнд)
 
@@ -223,3 +224,48 @@ Qinno-д л байгаа шаардлага: Claude↔Codex гэрээ + дав�
 5. **Pilot:** хэрэглэгч сэрүүн үед `--only S1` (DB_NAME-ийг эхэлж засна) → `auto` горим `drizzle-kit`
    / `aws` командыг блоклох эсэх, headless-д local MCP ачаалагдах эсэхийг бодитоор шалгана → дараа нь
    S2-S6 хүнгүй.
+
+## 11. Хэрхэн ашиглах (өөр pipeline дээр)
+
+Нэг pipeline = нэг төлөвлөгөөний хавтас (`plan_dir`) доторх сесс бүрийн task файл. Orchestrator target
+repo-д зөвхөн Claude/Codex-оор бичүүлнэ; commit/push/PR болон production (migrate, seed, deploy) хэрэглэгчийн хэрэг.
+
+1. **Pipeline бичих.** `pipelines/qinno-rbac-v2.yaml`-ийг загвар болго: `name`, `repo`, `plan_dir`,
+   `budget_usd` (`per_call`/`per_session`/`total`), `sessions[]` (`id`, `claude_task`, `codex_task` эсвэл
+   `null`, `handoff`, `depends_on`, `codex_allowlist`, `tests`, `post_steps`, `schema_allowlist`,
+   `memory_entities`, `known_red`). `tests` нь task файлын "Verification" командууд (pipe-гүй, exit code харагдах ёстой).
+   Task файлын команд энэ ажлаас ӨМНӨ ч улаан байсан бол (суурь commit дээр шалгаж нотолсон) `tests`-д биш
+   `known_red: [{command, reason}]`-д бичнэ: gate ажиллуулахгүй, verify/repair agent-д "STATUS-д бүү тооц" гэж дамжина.
+   Task файлд тодорхойгүй зүйлийг таамаглахгүй: `TODO ...` гэж үлдээвэл `orchestrator plan <yaml>` жагсаана.
+   Develop2 `post_steps` байхгүй бол `requires_stage: false` тавина (stage/DB шалгалт алгасна).
+   Policy-г зөвхөн чангатгана (`policy:` дахь `forbidden_write_globs` гэх мэт нэмэлт); сулруулах түлхүүр байхгүй.
+2. **Харах.** `uv run orchestrator plan pipelines/<name>.yaml` — дараалал, allowlist, tests, TODO.
+3. **Preflight.** `uv run orchestrator preflight --pipeline pipelines/<name>.yaml` — бүгд PASS байх ёстой
+   (claude/codex хувилбар, git, memory MCP, Mac цэнэглэгч). `power (Mac)` FAIL бол цэнэглэгч залгана.
+4. **Ажиллуулах — нэг сесс нэг сесс.**
+   `ORCHESTRATOR_IGNORE_ENV_LOCAL=1 caffeinate -i nice -n 15 uv run orchestrator run pipelines/<name>.yaml --only S1`
+   Үр дүнг `status`-аар шалгаад дараагийн `--only S2`-ийг ажиллуул. `--only`-гүй `run` нь бүх сессийг дарааллаар хийнэ
+   (зөвхөн эхний 1–2 сесс цэвэр, зардал тогтвортой болсны дараа). Зардлын хязгаар `budget_usd`.
+   **Анхаар:** `run` бүр шинэ run үүсгэх ба "дууссан" сессийг зөвхөн тухайн run дотроо алгасна. Өмнөх run-д
+   `done` болсон S1–S4 байхад `--only`-гүй `run` нь S1-ээс (post_steps-тэй нь) дахин эхэлнэ. Үлдсэн хэдэн сессийг
+   дараалуулах бол `run … --only S5 && run … --only S6` (сесс `done` биш дуусвал exit 2 тул `&&` зогсоно).
+   Model сонгох: `run`/`resume`-д `--model claude-sonnet-5-5` (бүх Claude алхамд; Codex-д хамаарахгүй).
+   Бодит model нь `session_init` event-ийн `"model"` талбарт харагдана.
+5. **Хянах.** Өөр terminal дээр `uv run orchestrator watch` → http://127.0.0.1:8765 (нууц redact; бичих
+   цорын ганц үйлдэл нь post step-ийн OK товч),
+   эсвэл `uv run orchestrator status [--pipeline <name>]`. Бүтэн гаралт `logs/` (post-step лог, 0600).
+   **Post step (O14).** Gate давсны дараа сесс `post_steps`-тэй бол run зогсож, ажиллуулах командуудыг
+   terminal болон `watch`-ийн шар хайрцагт харуулна. Тэдгээрийг qinno дээр дарааллаар нь ажиллуулж,
+   тайлбар дахь үр дүнг шалгаад (жишээ нь 2 дахь seed бүгд `0 added / 0 removed`) `watch` дээр **OK** дарна.
+   Хүлээж байхдаа Ctrl-C дарсан бол `resume` нь ижил хүлээлт рүү буцна, verify-г дахин ажиллуулахгүй.
+6. **Тасарвал / BLOCKED.** Шалтгааныг `status` ба `watch`-ийн events-ээс уншина. Орчны асуудал бол засаад
+   `uv run orchestrator resume` (дууссан алхмыг давтахгүй). `blocked`/`failed` алхмыг дахин оролдохыг
+   `resume --retry` гэнэ — шалтгааныг заасны дараа л.
+   - `per-call budget reached (error_max_budget_usd)`: алхам нэг дуудлагын `budget_usd.per_call`-д хүрсэн
+     (rbac-v2 S5 ③: $2-т тасарсан → yaml-д `per_call: 4`). Yaml-ийг засаад `resume --retry` (yaml-ийг дахин уншина).
+   - `quota_wait` (`rate limit rejected (five_hour)`): Claude-ийн хэрэглээний хязгаар; run цаг тутам өөрөө дахин
+     оролдоно. `resets_at` (unix) өнгөрсөн бол хүлээлгүй Ctrl-C → `resume` (`--retry` хэрэггүй).
+   - Verify `STATUS: BLOCKED` гэж бичсэн бол handoff-ийн шалтгааныг унш: target repo-д засвар хэрэгтэй бол
+     засаад `resume --retry` (зөвхөн verify дахин ажиллана; ③ давтагдахгүй).
+7. **Дууссаны дараа.** Сесс бүрийн handoff (`STATUS: DONE|BLOCKED` эхний мөр) target repo-ийн `plan_dir`-д
+   байна. Target repo-ийн dirty замыг шалгаад commit/push-ийг өөрөө хий; production алхмуудыг (release runbook) гараар.

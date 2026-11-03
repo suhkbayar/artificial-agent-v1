@@ -123,3 +123,57 @@ async def test_the_flow_runs_the_plan_step_read_only(toy_repo, tmp_path, mem_dir
         "read": "allow",
         "claude_write": "allow",
     }
+
+
+# ---- sed: only the line-range print is a read -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sed -n 20,40p calc.py",
+        "sed -n 5p calc.py",
+        "sed -n '30,$p' calc.py",
+        "sed -nE 1,3p calc.py",
+        "sed --quiet 1,2p calc.py",
+        "cat calc.py | sed -n 2,4p",
+    ],
+)
+def test_sed_line_range_print_is_a_read(ro, cmd):
+    assert isinstance(bash(ro, cmd), Allow), cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "sed -i s/a/b/ calc.py",
+        "sed -i '' s/a/b/ calc.py",
+        "sed --in-place s/a/b/ calc.py",
+        "sed -n '1w out.txt' calc.py",
+        "sed -n 'p;w out.txt' calc.py",
+        "sed -n 1e calc.py",
+        "sed -f script.sed calc.py",
+        "sed s/a/b/ calc.py",
+        "sed -n",
+        "sed -n -e 1p calc.py",
+    ],
+)
+def test_every_other_sed_is_still_denied(ro, cmd):
+    assert isinstance(bash(ro, cmd), Deny), cmd
+
+
+SCHEMA = "packages/db/src/schemas/core/operations.ts"
+
+
+def test_reading_a_schema_file_with_sed_is_not_a_schema_change(tmp_path):
+    ctx = PolicyContext(repo=tmp_path)  # a normal (non read-only) phase, schema locked
+    assert isinstance(bash(ctx, f"sed -n 20,40p {SCHEMA}"), Allow)
+    assert isinstance(bash(ctx, f"cat {SCHEMA}"), Allow)
+    for cmd in (f"sed -i s/a/b/ {SCHEMA}", f"sed -n '1w {SCHEMA}' x.ts", f"echo x > {SCHEMA}"):
+        d = bash(ctx, cmd)
+        assert isinstance(d, Deny) and d.hard_stop and "schema" in d.reason, cmd
+
+
+def test_sed_print_of_an_env_file_is_still_refused(tmp_path):
+    assert isinstance(bash(PolicyContext(repo=tmp_path), "sed -n 1,5p .env.local"), Deny)
+    assert isinstance(bash(PolicyContext(repo=tmp_path, read_only=True), "sed -n 1p .env"), Deny)

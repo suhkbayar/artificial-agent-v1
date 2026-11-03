@@ -231,3 +231,55 @@ def test_run_preflight_missing_repo(tmp_path):
     results = pf.run_preflight(load_pipeline(yaml, check_files=False), load_config(), fake({}))
     assert len(results) == 1 and not results[0].ok
     assert isinstance(Path(yaml), Path)
+
+
+# -- migrate-service/.env.local is the develop2 target ------------------------------------------
+
+FAKE_DB_PASSWORD = "fake-db-password-0123456789"
+
+
+def local_repo(tmp_path, **overrides):
+    values = {
+        "DB_HOST": "db.example.test", "DB_PORT": "5432", "DB_NAME": "qinno_develop2",
+        "DB_USER": "qinno_develop2_app", "DB_PASSWORD": FAKE_DB_PASSWORD, "DB_SSL": "true",
+    }  # fmt: skip
+    values.update(overrides)
+    d = tmp_path / "services" / "migrate-service"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ".env.local").write_text("".join(f"{k}={v}\n" for k, v in values.items() if v is not None))
+    return tmp_path
+
+
+def test_env_local_develop2_passes_even_when_env_is_production(tmp_path):
+    repo = env_repo(tmp_path, "DB_NAME=qinno\n")  # the stale production .env is irrelevant now
+    local_repo(repo)
+    r = pf.check_db_name(repo)
+    assert r.ok and ".env.local" in r.detail and "qinno_develop2" in r.detail
+
+
+def test_env_local_production_name_fails_even_when_env_is_develop2(tmp_path):
+    repo = env_repo(tmp_path, "DB_NAME=qinno_develop2\n")
+    local_repo(repo, DB_NAME="qinno")
+    r = pf.check_db_name(repo)
+    assert not r.ok and "PRODUCTION" in r.detail and ".env.local" in r.fix_hint
+
+
+def test_env_local_missing_a_key_fails_because_env_would_fill_the_gap(tmp_path):
+    repo = local_repo(env_repo(tmp_path, "DB_NAME=qinno\nDB_SSL=false\n"), DB_SSL=None)
+    r = pf.check_db_name(repo)
+    assert not r.ok and "DB_SSL" in r.detail
+
+
+def test_check_never_prints_the_password(tmp_path):
+    for name in ("qinno_develop2", "qinno", "other"):
+        r = pf.check_db_name(local_repo(tmp_path, DB_NAME=name))
+        assert FAKE_DB_PASSWORD not in repr(r)
+
+
+def test_aws_is_not_needed_with_env_local_but_still_checked_without(tmp_path):
+    run = fake({})  # any AWS command would raise AssertionError
+    local = pf.check_aws_if_needed(local_repo(tmp_path / "a"), run, 5)
+    assert local.ok and "not needed" in local.detail and run.calls == []
+    run = fake({("aws", "configure"): ok(LIST_STATIC), ("aws", "sts"): ok("{}")})
+    assert pf.check_aws_if_needed(env_repo(tmp_path / "b", "DB_NAME=x\n"), run, 5).ok
+    assert [c[1] for c in run.calls] == ["configure", "sts"]

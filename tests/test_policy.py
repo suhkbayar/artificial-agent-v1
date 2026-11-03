@@ -456,3 +456,28 @@ def test_pipeline_config_tightens_but_never_loosens(ctx):
         base.tightened({"allowed_mcp_prefixes": ["mcp__slack__"]})
     with pytest.raises(ValueError):
         base.tightened({"forbidden_write_globs": "docs/**"})
+
+
+def test_extra_writable_file_opens_exactly_that_file(ctx, tmp_path):
+    d = tmp_path / "memory"
+    d.mkdir()
+    ok = PolicyContext(repo=ctx.repo, extra_writable_files=(d / "confidence.jsonl",))
+    assert isinstance(w(ok, "Write", str(d / "confidence.jsonl")), Allow)
+    assert isinstance(w(ok, "Edit", str(d / "confidence.jsonl")), Allow)
+    assert_soft(w(ok, "Write", str(d / "other.txt")))  # same directory, other file
+    assert_soft(w(ok, "Write", str(d / "confidence.jsonl.bak")))
+    assert_soft(w(ok, "Write", str(d / "sub" / "confidence.jsonl")))
+    assert_soft(w(ok, "Write", str(d / "memory.jsonl")))  # graph file: MCP only
+    assert_soft(w(ctx, "Write", str(d / "confidence.jsonl")))  # not opened by default
+    # a symlink in the repo cannot smuggle a write to another file in that directory
+    (ctx.repo / "link").symlink_to(d / "memory.jsonl")
+    assert_soft(w(ok, "Write", str(ctx.repo / "link")))
+    assert_soft(bash(ok, f"echo x > {d}/other.txt"))
+    assert isinstance(bash(ok, f"echo x >> {d}/confidence.jsonl"), Allow)
+
+
+def test_extra_writable_file_still_denies_heredoc_and_inline_python(ctx, tmp_path):
+    f = tmp_path / "confidence.jsonl"
+    ok = PolicyContext(repo=ctx.repo, extra_writable_files=(f,))
+    assert not isinstance(bash(ok, f"cat <<EOF >> {f}\nx\nEOF"), Allow)
+    assert not isinstance(bash(ok, f"python3 -c \"open('{f}','a').write('x')\""), Allow)

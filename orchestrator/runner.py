@@ -397,6 +397,7 @@ async def run_step(
         }
         stream.effective_mode = mode
         detail = {
+            "model": data.get("model"),  # what the session really runs on (`--model`)
             "permission_mode": mode,
             "requested": request.permission_mode,
             "api_key_source": data.get("apiKeySource"),  # a NAME ("ANTHROPIC_API_KEY"), no value

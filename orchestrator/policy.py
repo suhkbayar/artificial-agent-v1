@@ -180,6 +180,8 @@ class PolicyContext:
     allowed_schema_globs: tuple[str, ...] = ()
     # Extra directories outside the repo the agent may write (system temp is always allowed).
     extra_writable_dirs: tuple[Path, ...] = ()
+    # Exact files outside the repo the agent may write (nothing else in their directory).
+    extra_writable_files: tuple[Path, ...] = ()
     # ① plan phase: nothing may be written, whatever the permission mode turns out to be. (A key in
     # the SDK env forces mode `default`, so SDK `plan` mode cannot be relied on to be read-only.)
     read_only: bool = False
@@ -437,8 +439,24 @@ _WRITE_FLAGS = frozenset(
 )
 
 
+# `sed` is NOT a read-only command (`-i`, `w file`, `e cmd` write or run things). Exactly one
+# shape is provably a read: quiet/regex flags plus a line-range print script (`sed -n 20,40p file`).
+_SED_READ_FLAGS = re.compile(r"^(?:-[nEsr]+|--quiet|--silent|--regexp-extended|--separate)\Z")
+_SED_PRINT_SCRIPT = re.compile(r"^(?:\d+|\$)(?:,(?:\d+|\$))?p\Z")
+
+
+def _sed_print_only(args: list[str]) -> bool:
+    flags = [a for a in args if a.startswith("-") and a != "-"]
+    rest = [a for a in args if a not in flags]
+    return (
+        bool(rest)
+        and all(_SED_READ_FLAGS.match(f) for f in flags)
+        and bool(_SED_PRINT_SCRIPT.match(rest[0]))
+    )
+
+
 # ---- read-only phase (S3: the plan step) ----------------------------------------------------
-# A deliberately SMALL allowlist: no awk/sed/xargs/env/shells (they can write or run anything).
+# A deliberately SMALL allowlist: no awk/xargs/env/shells, and sed only as `_sed_print_only`.
 _RO_COMMANDS = frozenset(
     {
         "cat", "ls", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "wc", "diff",
@@ -465,6 +483,8 @@ def _read_only_violation(cands: list[list[str]], redirects: list[str]) -> Deny |
         if target not in ("/dev/null", "/dev/stdout", "/dev/stderr"):
             return Deny(f"redirect to {target}: {why}")
     for head, *args in cands:
+        if head == "sed" and _sed_print_only(args):
+            continue
         if head not in _RO_COMMANDS:
             return Deny(
                 f"`{head}`: {why}; only read commands (cat, ls, grep, git status/diff/log...)"
@@ -717,6 +737,8 @@ def _is_writable_outside(path: Path, ctx: PolicyContext) -> bool:
     # a temp dir that contains the repo itself would make the repo's siblings writable
     roots = [r for r in temp_roots if r != repo and r not in repo.parents]
     roots += [d.resolve() for d in ctx.extra_writable_dirs]
+    if any(path == f.resolve() for f in ctx.extra_writable_files):
+        return True
     return any(path == r or r in path.parents for r in roots)
 
 
@@ -847,8 +869,10 @@ def _decide_bash(command: str, ctx: PolicyContext) -> Decision:
                         cwd = (repo / vp).resolve()
 
             # path rules: anything that is not provably read-only must not touch forbidden paths
-            read_only = head in _READONLY_COMMANDS or (
-                head == "git" and _git_sub(args) in _GIT_READONLY
+            read_only = (
+                head in _READONLY_COMMANDS
+                or (head == "git" and _git_sub(args) in _GIT_READONLY)
+                or (head == "sed" and _sed_print_only(args))
             )
             if read_only and head in {"tsc", "eslint", "prettier", "ruff", "find", "xargs", "env"}:
                 read_only = not any(a in _WRITE_FLAGS or a.startswith("--fix") for a in args)
@@ -875,13 +899,18 @@ def _decide_bash(command: str, ctx: PolicyContext) -> Decision:
                             )
                             break
                     continue
-                rel = _virtual_path(word, cwd, repo)
-                if rel is None:
-                    continue
-                if d := _path_violation(rel, ctx):
-                    if d.hard_stop:
-                        return d
-                    soft = soft or d
+                # a sed script carries its own file operands (`1w out.ts`): check each token too
+                parts = [word]
+                if head == "sed" and re.search(r"[\s;{}]", word):
+                    parts += [t for t in re.split(r"[\s;{}]+", word) if t]
+                for part in parts:
+                    rel = _virtual_path(part, cwd, repo)
+                    if rel is None:
+                        continue
+                    if d := _path_violation(rel, ctx):
+                        if d.hard_stop:
+                            return d
+                        soft = soft or d
 
         for target in (*sc.write_redirects, *nested_redirects):
             if _has_unresolved(target):

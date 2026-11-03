@@ -1,4 +1,10 @@
-STATUS: BLOCKED
+STATUS: DONE
+
+> Шинэчлэл 2026-10-30: pilot `--only S1` ажилласан (run 1, тайлбартай BLOCKED — S3 шалгуурт зөвшөөрөгдөнө),
+> `pilot-s1.md` бөглөгдсөн. Pilot-ын олдвороос засварласан: DB зорилт = `migrate-service/.env.local`,
+> `ORCHESTRATOR_IGNORE_ENV_LOCAL`, `sed -n` read-only + sed скриптийн операнд шалгалт. pytest 653 passed, 7 skipped.
+> S1-ийг дуусгах ба S2–S6 go/no-go → `next-session-prompt.md`. Доорх анхны текст түүх болж үлдэнэ.
+
 
 Блоклосон зүйл **зөвхөн pilot** (`--only S1` на qinno): таны нөхцөлүүд биелээгүй тул орсонгүй (`pilot-s1.md`).
 S3-ын бусад бүх код, тест, toy-repo дээрх бодит ①-⑤ урсгал бэлэн.
@@ -84,7 +90,7 @@ Gate results (run 2026-10-30, real output):
 
 ## Хийгээгүй / батлагдаагүй (нуулгүй)
 
-- **Pilot ороогүй.** `DB_NAME=qinno` (PRODUCTION), AWS key хүчингүй, таны шууд "эхэл"-ийн зөвшөөрөл байхгүй.
+- **Pilot ороогүй.** (Шинэчлэл: DB зорилт `migrate-service/.env.local` болж preflight 9/9 PASS — `pilot-s1.md`.) Үлдсэн: таны шууд "эхэл"-ийн зөвшөөрөл ба auth шийдвэр (API key кредитгүй).
   Тиймээс бодит post_steps (develop2 push/seed), qinno-д auto горим `drizzle-kit`/`aws`-ийг блоклох эсэх, qinno cwd-д MCP/hook —
   **бүгд харагдаагүй**. Post step-ийн "2 дахь seed 0 added / 0 removed" шалгалт нь seed-ийн хэвлэх мөрийн **таамагласан** regex-тэй
   (`0 added … 0 removed`) — бодит гаралтаар таарахгүй бол зөв seed-д хуурамч BLOCKED өгнө.

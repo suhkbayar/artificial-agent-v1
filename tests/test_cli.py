@@ -21,7 +21,8 @@ def test_plan_prints_order_allowlist_and_tests():
     assert text.index("1. S1") < text.index("6. S6")
     assert "packages/common/src/enums/permission/role-key.ts" in text
     assert "yarn workspace @qinno/merchant-service test" in text
-    assert "TODO (2):" in text and "S6.handoff" in text and "signing/updater" in text
+    assert "handoff-s6.md" in text
+    assert "TODO (" not in text
 
 
 def test_preflight_command_exit_code_and_table(monkeypatch):
@@ -66,3 +67,29 @@ def test_post_steps_lists_only_known_develop2_steps():
     out = CliRunner().invoke(cli.main, ["post-steps"])
     assert out.exit_code == 0 and "seed_merchant_develop2" in out.output
     assert "production" not in out.output.replace("never", "")
+
+
+def test_resume_passes_model_to_every_agent_phase(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    from orchestrator.flow import RunOutcome
+
+    monkeypatch.setenv(HOME_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(STATE_DB_ENV, str(tmp_path / "state.db"))
+    with StateDB(tmp_path / "state.db") as db:
+        rid = db.start_run("qinno-rbac-v2", REAL)
+        db.add_event("run_start", '{"only": "S2"}', run_id=rid)
+        db.finish_run(rid, "blocked")
+    seen = {}
+
+    async def fake_run(pipeline, config, deps, options, **kw):
+        seen["options"] = options
+        return RunOutcome(rid, "done")
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "build_deps", lambda: None)
+    monkeypatch.setattr(cli, "caffeinate", nullcontext)
+    out = CliRunner().invoke(cli.main, ["resume", "--retry", "--model", "claude-sonnet-5-5"])
+    assert out.exit_code == 0, out.output
+    opts = seen["options"]
+    assert (opts.model, opts.retry, opts.only) == ("claude-sonnet-5-5", True, "S2")

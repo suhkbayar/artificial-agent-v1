@@ -22,6 +22,11 @@ RUNNING = "running"
 DONE = "done"
 OPEN_STATUSES = ("pending", "running", "quota_wait")
 
+# O14: the flow records a USER_WAIT event (detail = JSON with the post steps to run) and waits for
+# a USER_OK event whose detail is that wait's event id; `watch` writes it when OK is pressed.
+USER_WAIT = "user_wait"
+USER_OK = "user_ok"
+
 _SCHEMA_V1 = """
 CREATE TABLE runs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -417,3 +422,38 @@ class StateDB:
                 "SELECT COUNT(*) FROM decisions WHERE run_id = ?", (run_id,)
             ).fetchone()[0]
         )
+
+
+def ack_user_wait(path: Path | str, wait_id: int) -> str | None:
+    """Record the user's OK for one USER_WAIT event (the `watch` button). Error text or None.
+
+    Opens an existing state.db read-write without migrating it, so a running `run`/`resume` (which
+    owns the schema) is never disturbed; the one row it adds is what that run is polling for.
+    """
+    path = Path(path)
+    if not path.exists():
+        return "state.db does not exist"
+    con = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")  # two clicks cannot both pass the "already OK" check
+        wait = con.execute(
+            "SELECT run_id, session_id FROM events WHERE id = ? AND kind = ?", (wait_id, USER_WAIT)
+        ).fetchone()
+        if wait is None:
+            con.execute("ROLLBACK")
+            return f"no wait #{wait_id}"
+        acked = con.execute(
+            "SELECT 1 FROM events WHERE kind = ? AND detail = ?", (USER_OK, str(wait_id))
+        ).fetchone()
+        if acked:
+            con.execute("ROLLBACK")
+            return f"wait #{wait_id} is already OK"
+        con.execute(
+            "INSERT INTO events (run_id, session_id, kind, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (wait[0], wait[1], USER_OK, str(wait_id), _now()),
+        )
+        con.execute("COMMIT")
+        return None
+    finally:
+        con.close()

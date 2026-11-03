@@ -184,6 +184,7 @@ async def test_init_message_records_mode_and_key_source_name_but_no_value(world)
         subtype="init",
         data={
             "permissionMode": "default",  # auto silently fell back
+            "model": "claude-sonnet-5-5",
             "apiKeySource": "ANTHROPIC_API_KEY",
             "mcp_servers": [{"name": "memory", "status": "connected"}],
             "tools": ["Bash", "Read"],
@@ -195,6 +196,7 @@ async def test_init_message_records_mode_and_key_source_name_but_no_value(world)
     ev = db.events(run_id, kind="session_init")
     assert len(ev) == 1
     assert '"permission_mode": "default"' in ev[0].detail
+    assert '"model": "claude-sonnet-5-5"' in ev[0].detail
     assert '"api_key_source": "ANTHROPIC_API_KEY"' in ev[0].detail
     assert '"memory": "connected"' in ev[0].detail
     notice = [e.detail for e in db.events(run_id, kind="notice")]
@@ -345,3 +347,13 @@ def test_read_tools_still_work_for_normal_files(ctx, tool, inp):
 def test_the_denial_reason_never_contains_a_secret_value(ctx):
     d = bash(ctx, f"echo {FAKE_KEY} && printenv")
     assert isinstance(d, Deny) and FAKE_KEY not in d.reason
+
+
+def test_ignore_env_local_flag_uses_the_login_and_leaves_the_file_alone(tmp_path):
+    from orchestrator.envfile import IGNORE_ENV_LOCAL_ENV, sdk_env
+
+    (tmp_path / ".env.local").write_text(f"ANTHROPIC_API_KEY={FAKE_KEY}\n")
+    assert sdk_env(tmp_path, environ={IGNORE_ENV_LOCAL_ENV: "1"}) == {}
+    assert FAKE_KEY in sdk_env(tmp_path, environ={})["ANTHROPIC_API_KEY"]
+    assert sdk_env(tmp_path, environ={IGNORE_ENV_LOCAL_ENV: "0"}) != {}
+    assert (tmp_path / ".env.local").read_text() == f"ANTHROPIC_API_KEY={FAKE_KEY}\n"

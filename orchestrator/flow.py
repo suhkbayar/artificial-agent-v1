@@ -3,7 +3,7 @@
     preflight -> ① plan (read-only) -> policy check of the plan (risky => BLOCKED)
               -> ② contract (only when the session has a Codex task)
               -> ③ Claude track -> snapshot A -> ④ Codex -> snapshot B (A->B = Codex's files)
-              -> ⑤ verify (a DIFFERENT agent) -> gates -> post_steps (O4, develop2) -> next session
+              -> ⑤ verify (a DIFFERENT agent) -> gates -> post_steps (develop2) -> next session
 
 Every Claude phase is a fresh SDK session (O2). Progress lives in state.db (`steps`, `attempts`,
 `events`); the heavy per-phase artefacts (plan, contract, snapshots) live in
@@ -12,7 +12,9 @@ whose step is `done` are skipped, the rest run again.
 
 Nothing here commits, pushes or checks out (O3) and production is out of reach (O8): post_steps
 are the develop2-only names in `pipeline.POST_STEPS`, re-checked by the stage preflight right
-before each one.
+before them. By default the user runs them (O14): the flow prints the commands, records a
+USER_WAIT event and waits for the OK pressed in `orchestrator watch`. `manual_post_steps = false`
+in config.toml restores O4 (the orchestrator runs them itself and checks their output).
 """
 
 from __future__ import annotations
@@ -20,7 +22,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
+import sys
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -29,7 +33,13 @@ from pathlib import Path
 
 from orchestrator import codex as codex_mod
 from orchestrator.config import Config
-from orchestrator.envfile import redact, secret_values
+from orchestrator.envfile import (
+    MIGRATE_ENV_LOCAL,
+    EnvFileError,
+    load_migrate_env,
+    redact,
+    secret_values,
+)
 from orchestrator.gates import (
     Attempt,
     GateVerdict,
@@ -46,6 +56,7 @@ from orchestrator.pipeline import POST_STEPS, REQUIRED_STAGE, Pipeline, SessionS
 from orchestrator.policy import Allow, Deny, PolicyContext, decide
 from orchestrator.preflight import (
     CheckResult,
+    CmdResult,
     Runner,
     all_ok,
     check_aws,
@@ -55,13 +66,25 @@ from orchestrator.preflight import (
     run_preflight,
 )
 from orchestrator.runner import QueryFn, StepResult, StepStatus, run_step_with_quota_retry
-from orchestrator.state import StateDB
+from orchestrator.state import USER_OK, USER_WAIT, StateDB
 
 PHASE_PLAN, PHASE_CONTRACT, PHASE_CLAUDE, PHASE_CODEX, PHASE_VERIFY = 1, 2, 3, 4, 5
 DECISIONS_FILE = "AUTONOMOUS-DECISIONS.md"
 MAX_REPAIR_ROUNDS = 2
 POST_STEP_TIMEOUT_S = 1800
-_NOOP_OK = re.compile(r"\b0\s+added\b.*\b0\s+removed\b|\b0\s+removed\b.*\b0\s+added\b", re.I | re.S)
+USER_POLL_S = 5  # how often a USER_WAIT looks for the OK from `watch`
+# drizzle-kit prints its error and still exits 0 when `strict: true` wants a confirmation but stdin
+# is not a TTY: the push did NOT happen, so exit 0 alone must not mark it done.
+_PUSH_FAILED = re.compile(r"Interactive prompts require a TTY|^\s*Error:", re.M)
+# A no-op seed run reports only zero counts ("0 added, 0 removed" or, as the real merchant seed
+# prints, "(0 new permission links)", "(0 inserted)"): at least one such count, all of them zero.
+_COUNT_BEFORE = re.compile(r"\b(\d+)\s+(?:new|inserted|added|removed)\b", re.I)
+_COUNT_AFTER = re.compile(r"\b(?:new|inserted|added|removed)\s*[:=]?\s*(\d+)\b", re.I)
+
+
+def _is_noop(output: str) -> bool:
+    counts = _COUNT_BEFORE.findall(output) + _COUNT_AFTER.findall(output)
+    return bool(counts) and all(int(c) == 0 for c in counts)
 
 
 # ---- dependencies / options / outcomes -------------------------------------------------------
@@ -198,9 +221,29 @@ RULES = (
     "- Never touch production or staging. Never read or print environment variables or "
     ".env files.\n"
     "- Nobody can answer questions. If something is undecided, choose the most conservative, "
-    "reversible option consistent with the plan files, and append it to "
-    f"{DECISIONS_FILE} in the plan directory as: `## <question>` then bullets `- Options:`, "
-    "`- Chosen:`, `- Reason:`, `- Files:`.\n"
+    "reversible option consistent with the plan files, and add it at the end of "
+    f"{DECISIONS_FILE} in the plan directory with the Edit tool (Write if it does not exist) "
+    "as: `## <question>` then bullets `- Options:`, `- Chosen:`, `- Reason:`, `- Files:`.\n"
+)
+
+# These tool habits are denied by the policy and cost a turn each (pilot run 1: 51 denials;
+# runs 3-6 still 3-9 each: heredoc appends to the decisions file, `node -e`, heredoc "probes",
+# the gate's per-locale jq loop re-run by hand, `sed -n` in the read-only plan step).
+TOOL_HYGIENE = (
+    "Tool habits (the policy denies these, each attempt wastes a turn; do not probe whether "
+    "they work):\n"
+    "- Do not start subagents (Task/Agent tool, e.g. a graph-reconciler agent).\n"
+    "- No heredocs (`<<EOF`, also not `cat >> file <<EOF`), no inline code (`python -c`, "
+    "`python - <<`, `node -e`), and no shell `for ... $var` loops "
+    "(use Read/Grep/Edit/Write, or one plain command per call).\n"
+    "- Read files with the Read tool (offset/limit), not `sed -n`; change them with Edit/Write.\n"
+    "- A gate command with a shell loop (e.g. the per-locale jq check) is run by the "
+    "orchestrator after you; to check it yourself, run its inner command on one file per call.\n"
+)
+NO_GRAPH_WRITES = (
+    "- Do not write to the memory graph or the confidence sidecar in this step, even if a "
+    "CLAUDE.md in the repo says to reconcile it after code changes: the orchestrator's step 5 "
+    "does that. Reading the graph is fine.\n"
 )
 
 
@@ -221,6 +264,20 @@ def memory_section(ctx_text: str) -> str:
     return f"\n## Memory graph context (read-only)\n{ctx_text}\n" if ctx_text else ""
 
 
+def known_red_section(known_red: tuple[tuple[str, str], ...]) -> str:
+    """Prompt lines for the pipeline's `known_red` commands ('' when there are none)."""
+    if not known_red:
+        return ""
+    return (
+        "Known red: these task-file commands already fail WITHOUT this work (a human checked "
+        "the base commit). They are not part of the gate, must not make the STATUS BLOCKED, and "
+        "are not yours to fix: do not run or re-diagnose them. List them in the handoff under "
+        "'Known red (not gated)' with the reason given here:\n"
+        + "\n".join(f"- `{command}`: {reason}" for command, reason in known_red)
+        + "\n"
+    )
+
+
 def verify_prompt(
     *,
     graph_ok: bool,
@@ -233,11 +290,14 @@ def verify_prompt(
     summary: str,
     claude_task_text: str,
     codex_task_text: str | None,
+    known_red: str = "",
 ) -> str:
     return (
         f"{RULES}\n## Step 5 of 5: VERIFY (you are NOT the agent that wrote this code)\n"
         "Do not change source files. Your only writes: the handoff file, "
-        f"{DECISIONS_FILE}, and (if allowed below) the memory graph.\n"
+        f"{DECISIONS_FILE}, and (if allowed below) the memory graph"
+        + (f" and {confidence_path}" if graph_ok else "")
+        + f".\n{TOOL_HYGIENE}"
         "Rubric - check each against the task files and the code, with evidence:\n"
         "1. Every acceptance criterion in the task file(s) is met.\n"
         "2. The contract (SDL / types / contract tests) is honoured.\n"
@@ -245,13 +305,16 @@ def verify_prompt(
         "including raw-query counts where stated.\n"
         "4. All of these commands pass when YOU run them:\n"
         f"{tests or '- (none)'}\n"
-        "5. If a `/codex-review` skill is available, run it on the diff and address findings "
-        "by reporting them (do not edit code).\n"
+        f"{known_red}"
+        "5. Review the diff yourself and report findings (do not edit code). Do not call "
+        "mcp__codex__codex: it is not available in unattended runs.\n"
         + (
             "6. Graph reconcile: update the memory graph for this session's decisions using "
             "ONLY the memory MCP tools (observations, new Decision:/Convention: entities). For "
             "every entity you create or change, also update its row in "
-            f"{confidence_path} in the same step. Never delete entities and "
+            f"{confidence_path} in the same step, with the Edit/Write tool (it is the one file "
+            "outside the repo you may write; no shell redirects or scripts). Never delete "
+            "entities and "
             "never touch 'Memory Model', 'Graph Legend' or 'Playbook'; write such wishes to "
             "the handoff under 'Ask first'.\n"
             if graph_ok
@@ -310,8 +373,8 @@ class Flow:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _event(self, kind: str, detail: str, session: str | None = None) -> None:
-        self.db.add_event(
+    def _event(self, kind: str, detail: str, session: str | None = None) -> int:
+        return self.db.add_event(
             kind, redact(detail, self.secrets), run_id=self.run_id or None, session_id=session
         )
 
@@ -330,6 +393,9 @@ class Flow:
         ctx = self.pipeline.policy_context(session)
         if phase == PHASE_PLAN:
             ctx = replace(ctx, read_only=True)  # holds even when the SDK forces mode `default`
+        if phase == PHASE_VERIFY and graph_usable:
+            # the gate wants the sidecar row updated in the same step: open that one file
+            ctx = replace(ctx, extra_writable_files=(self.deps.memory.confidence_path,))
         deny: set[str] = set()
         if phase != PHASE_VERIFY or not graph_usable:
             deny |= write_tool_names()  # the graph is written only by ⑤ verify
@@ -405,6 +471,11 @@ class Flow:
     def _step_done(self, step_id: int) -> bool:
         return self.db.get_step(step_id).status == "done"
 
+    def _gates_passed(self, session: SessionSpec) -> bool:
+        """The session's latest gate event in this run passed."""
+        gates = [e for e in self.db.events(self.run_id, "gate") if e.session_id == session.id]
+        return bool(gates) and json.loads(gates[-1].detail or "{}").get("passed") is True
+
     def _mark_done(self, step_id: int, note: str | None = None) -> None:
         self.db.update_step(step_id, status="done", last_error=note)
 
@@ -415,7 +486,7 @@ class Flow:
         if self._step_done(step_id):
             return
         prompt = (
-            f"{start_routine(session, self.pipeline)}\n{RULES}\n"
+            f"{start_routine(session, self.pipeline)}\n{RULES}{TOOL_HYGIENE}\n"
             "## Step 1 of 5: PLAN (read-only)\n"
             "Read the task and the code it touches. Do NOT change any file. Write the plan as your "
             "final message and END it with exactly one fenced json block:\n"
@@ -462,7 +533,7 @@ class Flow:
         work = self._work_dir(session)
         plan_text = (work / "plan.md").read_text() if (work / "plan.md").exists() else ""
         prompt = (
-            f"{RULES}\n## Step 2 of 5: CONTRACT\n"
+            f"{RULES}{TOOL_HYGIENE}\n## Step 2 of 5: CONTRACT\n"
             "Write the shared contract the Codex track depends on (SDL, types, contract tests) "
             "exactly as the Claude task file prescribes, directly in the repo. Then reply with the "
             "contract Codex must follow: file paths, signatures, expectations, test names. "
@@ -489,6 +560,7 @@ class Flow:
             "Implement the Claude part of the task per the approved plan. Run the relevant tests. "
             "Do not do the Codex track's work. Finish with a short summary (what changed, what is "
             "left, any decision you recorded).\n"
+            f"{TOOL_HYGIENE}{NO_GRAPH_WRITES}"
             f"{memory_section(mem)}\n## Approved plan\n{plan_text}\n"
             + (f"## Contract written in step 2\n{contract}\n" if contract else "")
             + f"## Task\n{self._task_text(session.claude_task)}"
@@ -567,6 +639,7 @@ class Flow:
             "## Step 4 of 5: CODEX TASK TAKEN OVER BY CLAUDE\n"
             "Codex failed twice on this task; do it yourself now, exactly as its task file says. "
             "Finish with a short summary.\n"
+            f"{TOOL_HYGIENE}{NO_GRAPH_WRITES}"
             f"{memory_section(mem)}\n## Contract\n{contract}\n"
             f"## Codex task\n{self._task_text(session.codex_task)}"
         )
@@ -606,6 +679,7 @@ class Flow:
                 confidence_path=store.confidence_path, plan_text=plan_text, summary=summary,
                 claude_task_text=self._task_text(session.claude_task),
                 codex_task_text=self._task_text(session.codex_task) if session.codex_task else None,
+                known_red=known_red_section(session.known_red),
             )  # fmt: skip
 
         stack = contextlib.ExitStack()
@@ -688,6 +762,33 @@ class Flow:
 
     # -- post steps (O4) ---------------------------------------------------------------------
 
+    def _migrate_env(self) -> dict[str, str]:
+        """DB_* from migrate-service/.env.local ({} = not used); the password joins redaction."""
+        try:
+            env = load_migrate_env(self.repo) or {}
+        except EnvFileError:
+            return {}  # check_db_name reports the unreadable file and the step is refused
+        # only the password is a secret: redacting DB_NAME/DB_HOST would blur every log line
+        extra = {"DB_PASSWORD": env["DB_PASSWORD"]} if "DB_PASSWORD" in env else {}
+        self.secrets = secret_values({**self.deps.sdk_env, **extra})
+        return env
+
+    def _save_post_step_log(self, session: SessionSpec, key: str, name: str, res: CmdResult) -> str:
+        """Redacted full output to logs/ (the event keeps only a tail). Returns the event line."""
+        stamp = self.deps.now().isoformat(timespec="seconds")
+        header = f"=== {stamp} {name} exit={res.returncode} timed_out={res.timed_out} ===\n"
+        text = redact(header + res.output, self.secrets) or ""
+        stem = f"post-step-run{self.run_id}-{session.id}-{key.replace(':', '-')}"
+        path = self.config.log_dir / f"{stem}.log"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:  # a retry appends, never overwrites
+                fh.write(text if text.endswith("\n") else text + "\n")
+        except OSError as exc:
+            return f"(full output not saved: {exc.strerror or exc})"
+        return f"full output: {path.resolve()}"
+
     def _post_steps(self, session: SessionSpec) -> str | None:
         """Run the develop2-only steps, each after a fresh stage check. Failure reason or None."""
         runner = self.deps.runner or run_command
@@ -705,27 +806,98 @@ class Flow:
             definition = POST_STEPS[name]
             if definition.stage != REQUIRED_STAGE:
                 return f"post step {name}: stage {definition.stage!r} is not {REQUIRED_STAGE}"
-            for check in (
-                check_db_name(self.repo),
-                check_sst_stage(self.repo),
-                check_aws(runner, t),
-            ):
+            local_env = self._migrate_env()
+            checks = [check_db_name(self.repo), check_sst_stage(self.repo)]
+            if not local_env:  # sync-secrets (sst) is the only AWS user; .env.local skips it
+                checks.append(check_aws(runner, t))
+            for check in checks:
                 if not check.ok:
                     return f"post step {name} refused: preflight {check.name}: {check.detail}"
+            if local_env:
+                command, env = definition.local_command, {**os.environ, **local_env}
+                self._event(
+                    "notice", f"post step {name}: DB_* from {MIGRATE_ENV_LOCAL}, no sync-secrets",
+                    session.id,
+                )  # fmt: skip
+            else:
+                command, env = definition.command, None
             res = runner(
-                ["bash", "-c", definition.command], timeout=POST_STEP_TIMEOUT_S, cwd=self.repo
+                ["bash", "-c", command], timeout=POST_STEP_TIMEOUT_S, cwd=self.repo, env=env
             )
             tail = "\n".join(res.output.splitlines()[-12:])
-            self._event("post_step_output", f"{name} exit={res.returncode}\n{tail}", session.id)
+            saved = self._save_post_step_log(session, key, name, res)
+            self._event(
+                "post_step_output", f"{name} exit={res.returncode}\n{saved}\n{tail}", session.id
+            )
             if res.timed_out or res.returncode != 0:
                 return f"post step {name} failed (exit {res.returncode}, timed_out={res.timed_out})"
-            if repeat and not _NOOP_OK.search(res.output):
+            if name.startswith("drizzle_push") and _PUSH_FAILED.search(res.output):
+                return f"post step {name} printed an error although it exited 0: nothing was pushed"
+            if repeat and not _is_noop(res.output):
                 return (
                     f"post step {name} (run {repeat + 1}) did not report 0 added / 0 removed; "
                     "the second run must be a no-op"
                 )
             self._event("post_step", key, session.id)
         return None
+
+    async def _user_post_steps(self, session: SessionSpec) -> str | None:
+        """O14: the user runs the post steps; wait for their OK from `watch`. Reason or None."""
+        done = {
+            e.detail for e in self.db.events(self.run_id, "post_step") if e.session_id == session.id
+        }
+        todo = [(f"{i}:{n}", n) for i, n in enumerate(session.post_steps) if f"{i}:{n}" not in done]
+        if not todo:
+            return None
+        for _, name in todo:
+            if POST_STEPS[name].stage != REQUIRED_STAGE:
+                return f"post step {name}: stage {POST_STEPS[name].stage!r} is not {REQUIRED_STAGE}"
+        for check in (check_db_name(self.repo), check_sst_stage(self.repo)):
+            if not check.ok:
+                return f"post steps refused: preflight {check.name}: {check.detail}"
+        keys = [key for key, _ in todo]
+        wait_id = next(
+            (e.id for e in reversed(self.db.events(self.run_id, USER_WAIT))
+             if e.session_id == session.id and json.loads(e.detail or "{}").get("keys") == keys),
+            None,
+        )  # fmt: skip
+        script = self._user_script(todo)
+        if wait_id is None:  # a resumed run keeps waiting on the same request
+            detail = json.dumps({"keys": keys, "script": script}, ensure_ascii=False)
+            wait_id = self._event(USER_WAIT, detail, session.id)
+        self.notify(
+            session.id,
+            f"{session.id}: waiting for the user to run {len(keys)} post step(s), then OK in "
+            f"`orchestrator watch` (wait #{wait_id})",
+        )
+        print(
+            f"\n>>> {session.id}: post step-үүдийг та ажиллуулна (wait #{wait_id}):\n\n{script}\n\n"
+            "Дууссаны дараа `uv run orchestrator watch` (http://127.0.0.1:8765) дээр OK дарна уу. "
+            "Хүлээж байна...",
+            file=sys.stderr, flush=True,
+        )  # fmt: skip
+        while not any(e.detail == str(wait_id) for e in self.db.events(self.run_id, USER_OK)):
+            await self.deps.sleep(USER_POLL_S)
+        for key in keys:
+            self._event("post_step", key, session.id)
+        self.notify(session.id, f"{session.id}: user OK for wait #{wait_id}; continuing")
+        return None
+
+    def _user_script(self, todo: list[tuple[str, str]]) -> str:
+        """The commands to paste, in order, each under a comment saying what to expect."""
+        lines = [
+            "# .sst/stage = develop2 байх ёстой. production/staging дээр БҮҮ ажиллуул.",
+            f"cd {self.repo}",
+        ]
+        seen: Counter[str] = Counter()
+        for n, (_, name) in enumerate(todo, 1):
+            seen[name] += 1
+            definition = POST_STEPS[name]
+            lines.append(f"# {n}. {name}: {definition.description}")
+            if seen[name] > 1:
+                lines.append(f"#    {seen[name]} дахь удаа: бүгд 0 added / 0 removed байх ёстой")
+            lines.append(definition.command)
+        return "\n".join(lines)
 
     # -- session / pipeline ------------------------------------------------------------------
 
@@ -764,7 +936,10 @@ class Flow:
             codex = await self._codex_track(session, steps[4].id, mem, graph_ok)
 
             failures: list[str] = []
-            for round_no in range(self.opts.max_repair_rounds + 1):
+            # gates already passed (e.g. Ctrl-C while waiting for the post steps): no new verify.
+            # Not the step status: the runner marks ⑤ done when the agent ends, before the gates.
+            rounds = 0 if self._gates_passed(session) else self.opts.max_repair_rounds + 1
+            for round_no in range(rounds):
                 self.db.update_step(steps[5].id, status="pending")
                 verdict, final, extra = await self._verify(
                     session, steps[5].id, mem, graph_ok, codex, failures
@@ -790,9 +965,13 @@ class Flow:
                 res = await self._agent(
                     session, PHASE_CLAUDE, steps[3].id,
                     f"{RULES}\n## Repair round {round_no + 1}\nThe gates failed. Fix the causes "
-                    "(code, tests); do not weaken tests. Gate failures:\n"
+                    "(code, tests); do not weaken tests. Failures starting with `memory:` are "
+                    "fixed by the verify agent in the next pass: leave the graph and sidecar "
+                    "alone.\n"
+                    f"{TOOL_HYGIENE}{NO_GRAPH_WRITES}Gate failures:\n"
                     + "\n".join(f"- {f}" for f in failures)
-                    + f"\n\n## Task\n{self._task_text(session.claude_task)}",
+                    + f"\n{known_red_section(session.known_red)}"
+                    + f"\n## Task\n{self._task_text(session.claude_task)}",
                     graph_usable=graph_ok,
                 )  # fmt: skip
                 after = self._snap(session, "repair-after")
@@ -806,7 +985,11 @@ class Flow:
                     return SessionOutcome(session.id, "blocked", reason)
 
             self._mark_done(steps[5].id)
-            if reason := self._post_steps(session):
+            if reason := (
+                await self._user_post_steps(session)
+                if self.config.manual_post_steps
+                else self._post_steps(session)
+            ):
                 self.db.update_step(steps[5].id, status="blocked", last_error=reason)
                 self.notify(session.id, f"{session.id} post step: BLOCKED: {reason}")
                 return SessionOutcome(session.id, "blocked", reason)

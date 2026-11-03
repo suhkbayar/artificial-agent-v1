@@ -1,7 +1,11 @@
 """Preflight (readme §6): every check returns a CheckResult; any failure means DO NOT START.
 
-Checks only read. In particular the qinno `.env` and `.sst/stage` are never written; the fix for
-a wrong DB_NAME is the user's `npm run sync-secrets -- --stage=develop2`.
+Checks only read. In particular the qinno `.env`, `.env.local` and `.sst/stage` are never written;
+the fix for a wrong DB_NAME is the user's (`npm run sync-secrets -- --stage=develop2`, or editing
+`services/migrate-service/.env.local`).
+
+Database target: when `services/migrate-service/.env.local` exists it IS the target (the post steps
+run with its DB_* and skip sync-secrets/AWS); otherwise the `.env` that sync-secrets writes is.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from orchestrator.config import Config
+from orchestrator.envfile import DB_KEYS, MIGRATE_ENV_LOCAL, EnvFileError, load_migrate_env
 from orchestrator.pipeline import REQUIRED_STAGE, Pipeline
 
 EXPECTED_DB_NAME = "qinno_develop2"
@@ -23,6 +28,7 @@ PRODUCTION_DB_NAME = "qinno"
 MIN_CLAUDE_VERSION = (2, 1, 259)
 # `aws configure list` credential types that are long-lived keys (not SSO/role sessions that
 # expire mid-night).
+AWS_CHECK = "AWS credentials"
 STATIC_AWS_CREDENTIAL_TYPES = frozenset({"env", "shared-credentials-file", "config-file"})
 
 
@@ -97,20 +103,41 @@ def parse_env_value(text: str, key: str) -> str | None:
     return None
 
 
+def uses_local_db_env(repo: Path) -> bool:
+    """True when the develop2 target comes from `services/migrate-service/.env.local`."""
+    return (repo / MIGRATE_ENV_LOCAL).is_file()
+
+
+def _judge_db_name(name: str, value: str | None, source: str, fix: str) -> CheckResult:
+    if value == EXPECTED_DB_NAME:
+        return CheckResult(name, True, f"DB_NAME={value} ({source})")
+    if value == PRODUCTION_DB_NAME:
+        return CheckResult(name, False, f"DB_NAME={value} is PRODUCTION ({source})", fix)
+    return CheckResult(
+        name, False, f"DB_NAME={value!r}, expected {EXPECTED_DB_NAME} ({source})", fix
+    )
+
+
 def check_db_name(repo: Path) -> CheckResult:
     name = "migrate-service DB_NAME"
+    if uses_local_db_env(repo):
+        source = str(MIGRATE_ENV_LOCAL)
+        fix = f"edit {source} (user): DB_NAME={EXPECTED_DB_NAME} and all of {', '.join(DB_KEYS)}"
+        try:
+            env = load_migrate_env(repo) or {}
+        except EnvFileError as exc:
+            return CheckResult(name, False, str(exc), fix)
+        missing = [k for k in DB_KEYS if k not in env]
+        if missing:  # a partial file would let `.env` (production) fill the gaps
+            return CheckResult(name, False, f"{source} lacks {', '.join(missing)}", fix)
+        return _judge_db_name(name, env["DB_NAME"], source, fix)
     env_file = repo / "services" / "migrate-service" / ".env"
     fix = "npm run sync-secrets -- --stage=develop2 (run by the user, in services/migrate-service)"
     try:
         text = env_file.read_text()
     except OSError as exc:
         return CheckResult(name, False, f"cannot read {env_file}: {exc.strerror}", fix)
-    value = parse_env_value(text, "DB_NAME")
-    if value == EXPECTED_DB_NAME:
-        return CheckResult(name, True, f"DB_NAME={value}")
-    if value == PRODUCTION_DB_NAME:
-        return CheckResult(name, False, f"DB_NAME={value} is PRODUCTION", fix)
-    return CheckResult(name, False, f"DB_NAME={value!r}, expected {EXPECTED_DB_NAME}", fix)
+    return _judge_db_name(name, parse_env_value(text, "DB_NAME"), ".env", fix)
 
 
 def check_sst_stage(repo: Path) -> CheckResult:
@@ -136,7 +163,7 @@ def check_sst_stage(repo: Path) -> CheckResult:
 
 
 def check_aws(run: Runner, timeout: int) -> CheckResult:
-    name = "AWS credentials"
+    name = AWS_CHECK
     listed = run(["aws", "configure", "list"], timeout=timeout)
     if listed.not_found:
         return CheckResult(name, False, "aws CLI not found", "install the AWS CLI")
@@ -180,6 +207,15 @@ def check_aws(run: Runner, timeout: int) -> CheckResult:
             "the static key is invalid or expired",
         )
     return CheckResult(name, True, f"static key ({cred_type}), sts get-caller-identity ok")
+
+
+def check_aws_if_needed(repo: Path, run: Runner, timeout: int) -> CheckResult:
+    """AWS is only used by sync-secrets (`sst secret list`); the .env.local route never calls it."""
+    if uses_local_db_env(repo):
+        return CheckResult(
+            AWS_CHECK, True, f"not needed: post steps use {MIGRATE_ENV_LOCAL} (no sync-secrets/sst)"
+        )
+    return check_aws(run, timeout)
 
 
 def check_codex_ready(run: Runner, timeout: int) -> CheckResult:
@@ -309,7 +345,7 @@ def run_preflight(
     if not repo.is_dir():
         return [CheckResult("repo", False, f"repo not found: {repo}", "fix `repo:` in the yaml")]
     stage_checks = (
-        [check_db_name(repo), check_sst_stage(repo), check_aws(runner, t)]
+        [check_db_name(repo), check_sst_stage(repo), check_aws_if_needed(repo, runner, t)]
         if pipeline.requires_stage
         else []
     )

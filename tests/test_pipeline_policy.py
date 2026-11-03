@@ -203,8 +203,22 @@ def test_requires_stage_false_forbids_post_steps(tmp_path):
         load_pipeline(tmp_path / "p.yaml", check_files=False)
 
 
-def test_open_items_show_up_as_todos(pipeline):
-    assert any("signing/updater" in t for t in pipeline.todos())
+def test_real_pipeline_has_no_open_todos(pipeline):
+    assert pipeline.todos() == []
+    assert {s.id: s.handoff for s in pipeline.sessions}["S6"] == "handoff-s6.md"
+
+
+def test_signing_updater_paths_are_denied_by_builtin_globs(pipeline):
+    # No extra forbidden_write_globs are added for signing/updater: the Tauri agent's updater
+    # config and the signing workflow already sit under the built-in `apps/agent/**` / `.github/**`.
+    from orchestrator.policy import matches_any
+
+    globs = pipeline.policy_config(pipeline.sessions[0]).forbidden_write_globs
+    for path in (
+        "apps/agent/app/src-tauri/tauri.conf.json",
+        ".github/workflows/build-agent.yml",
+    ):
+        assert matches_any(globs, path), path
 
 
 # ---- 3d: attempts persisted and restored -------------------------------------------------------
@@ -338,3 +352,44 @@ def test_quota_phrases_seen_in_the_wild():
 def test_policy_guard_is_untouched_by_all_this():
     assert PolicyGuard(PolicyContext(repo=Path("/x"))).stop_requested is False
     assert json.dumps(REAL_RATE_LIMIT_INFO)
+
+
+def test_known_red_parses_and_stays_out_of_the_gated_tests(tmp_path):
+    raw = yaml.safe_load(_yaml(tmp_path).read_text())
+    raw["sessions"][0]["known_red"] = [{"command": " npx tsc -p x ", "reason": "red at base"}]
+    (tmp_path / "p.yaml").write_text(yaml.safe_dump(raw))
+    session = load_pipeline(tmp_path / "p.yaml", check_files=False).sessions[0]
+    assert session.known_red == (("npx tsc -p x", "red at base"),)
+    assert "npx tsc -p x" not in session.tests
+
+
+@pytest.mark.parametrize(
+    "known_red",
+    [
+        "not-a-list",
+        [{"command": "x"}],  # no reason
+        [{"command": "x", "reason": "  "}],
+        [{"command": "x", "reason": "r", "gated": False}],  # unknown key
+        ["x"],
+    ],
+)
+def test_malformed_known_red_is_a_pipeline_error(tmp_path, known_red):
+    raw = yaml.safe_load(_yaml(tmp_path).read_text())
+    raw["sessions"][0]["known_red"] = known_red
+    (tmp_path / "p.yaml").write_text(yaml.safe_dump(raw))
+    with pytest.raises(PipelineError, match="known_red"):
+        load_pipeline(tmp_path / "p.yaml", check_files=False)
+
+
+def test_a_command_cannot_be_both_gated_and_known_red(tmp_path):
+    raw = yaml.safe_load(_yaml(tmp_path).read_text())
+    raw["sessions"][0]["tests"] = ["npx tsc -p x"]
+    raw["sessions"][0]["known_red"] = [{"command": "npx tsc -p x", "reason": "r"}]
+    (tmp_path / "p.yaml").write_text(yaml.safe_dump(raw))
+    with pytest.raises(PipelineError, match="both tests and known_red"):
+        load_pipeline(tmp_path / "p.yaml", check_files=False)
+
+
+def test_real_pipeline_marks_the_migrate_service_type_check_known_red(pipeline):
+    s2 = {s.id: s for s in pipeline.sessions}["S2"]
+    assert [c for c, _ in s2.known_red] == ["npx tsc --noEmit -p services/migrate-service"]
